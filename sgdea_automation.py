@@ -21,6 +21,7 @@ from expediente_pdf import (
 from pdf_download import descargar_pdf_abriendo_visor, descargar_pdf_autenticado
 from pdf_extractor import extraer_datos_auto_admite, extraer_pretensiones_escrito
 from plantilla_word import PLANTILLA_DEFAULT, llenar_plantilla
+from sgdea_comunicacion import crear_comunicacion_externa, leer_destinatario_gestion
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -407,10 +408,23 @@ class AutomatizacionSGDEA:
         )
 
         ruta_docx = carpeta / f"Plantilla_{radicado_sgdea}.docx"
-        llenar_plantilla(datos, ruta_docx, plantilla=PLANTILLA_DEFAULT)
-        self.log(f"  → Word generado: {ruta_docx}")
-
-        self.log(
-            "  → El PDF queda abierto en el modal del expediente "
-            "(ciérrelo con la X cuando termine de revisar)."
+        ruta_generada = llenar_plantilla(
+            datos, ruta_docx, plantilla=PLANTILLA_DEFAULT
         )
+        if ruta_generada.resolve() != ruta_docx.resolve():
+            self.log(
+                f"  → Word generado (archivo anterior abierto): {ruta_generada.name}"
+            )
+        else:
+            self.log(f"  → Word generado: {ruta_generada}")
+
+        destinatario = leer_destinatario_gestion(page)
+        try:
+            crear_comunicacion_externa(page, self.log, destinatario)
+        except PlaywrightTimeoutError as exc:
+            self.log(
+                f"  → Comunicación externa: tiempo de espera agotado ({exc}). "
+                "Complete el paso manualmente en pantalla."
+            )
+        except Exception as exc:
+            self.log(f"  → Comunicación externa: {exc}")
