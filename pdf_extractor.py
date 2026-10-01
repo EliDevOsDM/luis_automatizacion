@@ -35,13 +35,19 @@ _MARCADORES_SIGUIENTE_CAMPO = (
     r"PROCESO\s*:",
     r"ACCIONANTE\s*:",
     r"ACCIONADO\s*:",
+    r"ACCIONADA\s*:",
     r"VINCULACI[OÓ]N\s*:",
     r"VINCULADOS\s*:",
     r"RADICACI[OÓ]N\s*:",
     r"RADICADO\s*:",
+    r"UBICACI[OÓ]N\s*:",
+    r"AUTO\s+ADMITE",
+    r"CONSTANCIA",
     r"Bogot[aá]",
     r"RESUELVE",
 )
+
+_TAMANO_CABECERA_AUTO = 2500
 
 
 def _texto_con_pypdf(datos: bytes) -> str:
@@ -92,6 +98,24 @@ def _limpiar_valor(texto: str) -> str:
     return re.sub(r"\s+", " ", texto).strip(" .,:;")
 
 
+def _campo_cabecera_linea(
+    texto: str,
+    etiquetas: tuple[str, ...],
+    *,
+    max_chars: int = _TAMANO_CABECERA_AUTO,
+) -> str:
+    """Campos en las primeras líneas del auto (evita «accionado» en el cuerpo)."""
+    cabecera = texto[:max_chars]
+    for etiqueta in etiquetas:
+        patron = rf"(?im)(?:^|\n)\s*{re.escape(etiqueta)}\s*:?\s*([^\n\r]+)"
+        coincidencia = re.search(patron, cabecera)
+        if coincidencia:
+            valor = _limpiar_valor(coincidencia.group(1))
+            if valor:
+                return valor
+    return ""
+
+
 def _campo_judicial(texto: str, etiquetas: tuple[str, ...]) -> str:
     fin = "|".join(_MARCADORES_SIGUIENTE_CAMPO)
     for etiqueta in etiquetas:
@@ -115,16 +139,28 @@ def _campo_judicial(texto: str, etiquetas: tuple[str, ...]) -> str:
 
 
 def _extraer_radicado(texto: str) -> str:
-    for etiqueta in ("RADICADO", "RADICACIÓN", "RADICACION"):
-        valor = _campo_judicial(texto, (etiqueta,))
-        if valor:
-            return valor
+    cabecera = texto[:_TAMANO_CABECERA_AUTO]
+    coincidencia = re.search(
+        r"(?im)(?:RADICACI[OÓ]N|RADICADO)\s*:?\s*(\d{15,25})",
+        cabecera,
+    )
+    if coincidencia:
+        return coincidencia.group(1).strip()
     coincidencia = re.search(
         r"(?:RADICACI[OÓ]N|RADICADO)\s*:?\s*([0-9\-]+)",
-        texto,
+        cabecera,
         re.IGNORECASE,
     )
-    return coincidencia.group(1).strip() if coincidencia else ""
+    if coincidencia:
+        return coincidencia.group(1).strip()
+    for etiqueta in ("RADICADO", "RADICACIÓN", "RADICACION"):
+        valor = _campo_cabecera_linea(texto, (etiqueta,))
+        if valor:
+            solo_digitos = re.match(r"(\d{15,25})", valor)
+            if solo_digitos:
+                return solo_digitos.group(1)
+            return valor
+    return ""
 
 
 def _extraer_vinculados(texto: str) -> str:
@@ -139,18 +175,32 @@ def _extraer_vinculados(texto: str) -> str:
 
 
 _MARCADORES_FIN_PRETENSIONES_ESCrito = (
+    r"(?:^|\n)\s*V\.\s*PRUEBAS",
+    r"(?:^|\n)\s*VI\.\s*JURAMENTO",
     r"(?:^|\n)\s*V\.\s*JURAMENTO",
+    r"(?:^|\n)\s*VII\.\s*NOTIFICACIONES",
     r"(?:^|\n)\s*III\.\s*DE\s+LOS\s+DERECHOS",
     r"DE\s+LOS\s+DERECHOS\s+DE\s+PETICI",
 )
 
 _MARCADORES_INICIO_PRETENSIONES_ESCrito = (
     r"IV\.\s*PRETENSIONES",
-    r"pretendió\s*:",
-    r"pretendio\s*:",
-    r"PRETENSIONES",
     r"PRETENSIÓN\s+DE\s+LA\s+ACCIONANTE",
     r"PRETENSION\s+DE\s+LA\s+ACCIONANTE",
+    r"pretendió\s*:",
+    r"pretendio\s*:",
+    r"(?:^|\n)\s*PRETENSIONES\b",
+)
+
+_VERBOS_PRETENSION = (
+    r"AMPARAR",
+    r"ORDENAR",
+    r"DECLARAR",
+    r"TUTELAR",
+    r"DEJAR\s+SIN\s+EFECTO",
+    r"PREVENIR",
+    r"CONDENAR",
+    r"SOLICITO\s+QUE",
 )
 
 
@@ -217,6 +267,39 @@ def _extraer_pretensiones_desde_bloque(bloque: str) -> dict[str, str]:
     return resultado
 
 
+def _extraer_pretensiones_por_verbos(bloque: str) -> dict[str, str]:
+    """Escritos sin PRIMERA/SEGUNDA (p. ej. párrafos AMPARAR… ORDENAR…)."""
+    texto = re.sub(r"\s+", " ", bloque).strip()
+    intro = re.search(
+        r"(?i)(?:señor|senor)\s+juez\s*:?\s*",
+        texto,
+    )
+    if intro:
+        texto = texto[intro.end() :].strip()
+
+    alternancia = "|".join(_VERBOS_PRETENSION)
+    segmentos = re.findall(
+        rf"((?:{alternancia})\b.+?)(?=(?:{alternancia})\b|$)",
+        texto,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    resultado: dict[str, str] = {}
+    for indice, segmento in enumerate(segmentos):
+        if indice >= len(_ORDINALES_PRETENSION):
+            break
+        ordinal = _ORDINALES_PRETENSION[indice]
+        if ordinal == "SEPTIMA":
+            clave = "SÉPTIMA"
+        elif ordinal in ("SÉPTIMA",):
+            clave = "SÉPTIMA"
+        else:
+            clave = ordinal
+        valor = _limpiar_valor(segmento)
+        if len(valor) > 10:
+            resultado[clave] = valor
+    return resultado
+
+
 def extraer_pretensiones_escrito(ruta_pdf: Path) -> dict[str, str]:
     texto = _leer_texto_pdf(ruta_pdf)
     bloque = _recortar_bloque_pretensiones_escrito(texto)
@@ -225,6 +308,8 @@ def extraer_pretensiones_escrito(ruta_pdf: Path) -> dict[str, str]:
             f"No se encontró la sección de pretensiones en {ruta_pdf.name}"
         )
     pretensiones = _extraer_pretensiones_desde_bloque(bloque)
+    if not pretensiones:
+        pretensiones = _extraer_pretensiones_por_verbos(bloque)
     if not pretensiones:
         raise ValueError(
             f"No se pudieron leer PRIMERA, SEGUNDA… en {ruta_pdf.name}"
@@ -265,13 +350,19 @@ def extraer_datos_auto_admite(ruta_pdf: Path) -> DatosAutoAdmite:
     if not texto.strip():
         raise ValueError(f"No se pudo leer texto del PDF: {ruta_pdf.name}")
 
+    tipo_proceso = _campo_cabecera_linea(
+        texto, ("TIPO DE PROCESO", "PROCESO", "REFERENCIA")
+    )
+    if not tipo_proceso:
+        tipo_proceso = _campo_judicial(texto, ("TIPO DE PROCESO", "PROCESO"))
+
     datos = DatosAutoAdmite(
         radicado=_extraer_radicado(texto),
-        tipo_proceso=_campo_judicial(
-            texto, ("TIPO DE PROCESO", "PROCESO")
+        tipo_proceso=tipo_proceso,
+        accionante=_campo_cabecera_linea(texto, ("ACCIONANTE",)),
+        accionado=_campo_cabecera_linea(
+            texto, ("ACCIONADO", "ACCIONADA")
         ),
-        accionante=_campo_judicial(texto, ("ACCIONANTE",)),
-        accionado=_campo_judicial(texto, ("ACCIONADO",)),
         vinculados=_extraer_vinculados(texto),
         fecha_auto_admisorio=_extraer_fecha_auto(texto),
         pretensiones={},
