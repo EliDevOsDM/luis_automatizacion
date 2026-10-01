@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import time
 from pathlib import Path
 
 from docx import Document
@@ -47,6 +48,10 @@ def _estilo_run(run, *, negrita: bool = False, cursiva: bool = False) -> None:
         italic = r_pr.find(qn("w:i"))
         if italic is not None:
             r_pr.remove(italic)
+    run.font.highlight_color = None
+    resaltado = r_pr.find(qn("w:highlight"))
+    if resaltado is not None:
+        r_pr.remove(resaltado)
 
 
 def _limpiar_parrafo(parrafo: Paragraph) -> None:
@@ -163,6 +168,27 @@ def _ordinal_desde_parrafo(texto_parrafo: str) -> str | None:
     return ordinal
 
 
+def _archivo_en_uso(exc: OSError) -> bool:
+    return exc.errno in (13, 32) or getattr(exc, "winerror", None) in (5, 32)
+
+
+def _publicar_docx_generado(temporal: Path, destino: Path) -> Path:
+    """Mueve el .docx temporal al destino; reintenta si Word lo tiene abierto."""
+    for intento in range(12):
+        try:
+            temporal.replace(destino)
+            return destino
+        except OSError as exc:
+            if not _archivo_en_uso(exc):
+                raise
+            time.sleep(0.6 * (intento + 1))
+
+    marca = time.strftime("%Y%m%d_%H%M%S")
+    alterno = destino.with_name(f"{destino.stem}_{marca}{destino.suffix}")
+    temporal.replace(alterno)
+    return alterno
+
+
 def llenar_plantilla(
     datos: DatosAutoAdmite,
     ruta_salida: Path,
@@ -174,8 +200,9 @@ def llenar_plantilla(
         raise FileNotFoundError(f"No se encontró la plantilla: {origen}")
 
     ruta_salida.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(origen, ruta_salida)
-    doc = Document(str(ruta_salida))
+    temporal = ruta_salida.with_name(f"{ruta_salida.stem}.__tmp__.docx")
+    shutil.copy2(origen, temporal)
+    doc = Document(str(temporal))
 
     if doc.paragraphs:
         _asignar_campo_cabecera(
@@ -214,6 +241,7 @@ def llenar_plantilla(
             continue
         cuerpo = datos.pretensiones.get(ordinal)
         if not cuerpo:
+            _limpiar_parrafo(parrafo)
             continue
         prefijo = _prefijo_pretension(parrafo.text) or f"{ordinal}. "
         _asignar_texto_conservando_estilo(
@@ -226,5 +254,6 @@ def llenar_plantilla(
                 break
 
     _aplicar_verdana_documento(doc)
-    doc.save(str(ruta_salida))
-    return ruta_salida
+    doc.save(str(temporal))
+    publicado = _publicar_docx_generado(temporal, ruta_salida)
+    return publicado
